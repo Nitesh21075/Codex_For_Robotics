@@ -21,7 +21,18 @@ MIN_DURATION_S = 0.1
 MAX_DURATION_S = 120.0
 MAX_SIGNALS = 8
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$")
+_SAFE_MORPHOLOGY = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _RUN_PREFIX = "run_"
+ADAPTER_FAMILIES: dict[str, dict[str, str]] = {
+    "rail_train_kinematic": {
+        "description": "Fixed-route, one-dimensional train/monorail/rail shuttle scene with train commands and camera evidence.",
+        "required_project_asset": "mission.json",
+    },
+    "articulated_position_control": {
+        "description": "Fixed-base articulated URDF position-control scene for hands, arms, grippers, and similar mechanisms.",
+        "required_project_asset": "robot.urdf or model/*.urdf",
+    },
+}
 
 # A tiny valid JPEG.  A real simulator overwrites these fallback frames with
 # robot-camera images; having an image in the fallback keeps the visual tool
@@ -244,6 +255,95 @@ class ProjectTools:
             "metrics": metrics,
         }
 
+    def get_adapter_capabilities(self) -> dict[str, Any]:
+        """Return the bounded adapter families Codex may declare for this project.
+
+        This intentionally exposes families rather than server-plugin source
+        code: a project agent can extend its project safely, while the
+        RoboPilot service remains responsible for the executable simulator.
+        """
+        return {
+            "adapter_manifest": "adapter.json",
+            "families": [
+                {"family": family, **details}
+                for family, details in sorted(ADAPTER_FAMILIES.items())
+            ],
+            "workflow": [
+                "Set spec.json morphology to the new project type.",
+                "Create needed project assets and controller code.",
+                "Create an adapter draft, then validate it with a real short run.",
+                "Only a validated adapter is available to ordinary project runs.",
+            ],
+        }
+
+    def create_adapter_draft(self, morphology: str, family: str, display_name: str | None = None) -> dict[str, Any]:
+        """Create a data-only adapter draft for this session's declared morphology."""
+        if not isinstance(morphology, str) or not _SAFE_MORPHOLOGY.fullmatch(morphology):
+            raise ProjectToolError("morphology must be lowercase snake_case (2-64 characters)")
+        if family not in ADAPTER_FAMILIES:
+            raise ProjectToolError(f"unsupported adapter family '{family}'")
+        declared = self._declared_morphology()
+        if declared != morphology:
+            raise ProjectToolError(
+                f"spec.json declares morphology '{declared}'; update it before creating this adapter"
+            )
+        if display_name is not None and (not isinstance(display_name, str) or not display_name.strip() or len(display_name) > 120):
+            raise ProjectToolError("display_name must be a non-empty string up to 120 characters")
+        manifest = {
+            "schema_version": 1,
+            "morphology": morphology,
+            "family": family,
+            "status": "draft",
+            "display_name": display_name.strip() if isinstance(display_name, str) else morphology.replace("_", " ").title(),
+        }
+        self._adapter_path().write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return {"adapter": manifest, "path": "adapter.json", "next_action": "Write the required project assets, then call validate_adapter_draft."}
+
+    def validate_adapter_draft(self, duration_s: float = 3.0) -> dict[str, Any]:
+        """Run a draft through its declared family and promote it only if it launches.
+
+        A task may still fail (for example a route is too long for a short
+        validation), but a crashed or unavailable adapter is never promoted.
+        """
+        duration = _as_number(duration_s, "duration_s")
+        if not 0.1 <= duration <= 15.0:
+            raise ProjectToolError("duration_s must be between 0.1 and 15 for adapter validation")
+        manifest = self._read_adapter_manifest()
+        if manifest.get("status") not in {"draft", "validated"}:
+            raise ProjectToolError("adapter.json must contain a draft or validated adapter")
+        if manifest.get("morphology") != self._declared_morphology():
+            raise ProjectToolError("adapter morphology no longer matches spec.json")
+        family = manifest.get("family")
+        if family not in ADAPTER_FAMILIES:
+            raise ProjectToolError("adapter.json selects an unsupported family")
+        try:
+            simulator = importlib.import_module("server.sim_tool")
+            runner = getattr(simulator, "run_project")
+            result = runner(
+                workspace=self.session_root,
+                duration_s=duration,
+                mode="batch",
+                scenario="adapter_validation",
+                allow_draft_adapter=True,
+            )
+        except Exception as exc:
+            manifest["status"] = "draft"
+            manifest["validation_error"] = str(exc)[:500]
+            self._adapter_path().write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            return {"validated": False, "adapter": manifest, "error": str(exc)[:500]}
+        status = result.get("status") if isinstance(result, Mapping) else "crashed"
+        if status == "crashed":
+            manifest["status"] = "draft"
+            manifest["validation_error"] = str(result.get("stderr", "adapter run crashed"))[:500]
+            validated = False
+        else:
+            manifest["status"] = "validated"
+            manifest["validation_run_id"] = result.get("run_id")
+            manifest.pop("validation_error", None)
+            validated = True
+        self._adapter_path().write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return {"validated": validated, "adapter": manifest, "run": result}
+
     def _load_simulator(self) -> Any | None:
         try:
             return importlib.import_module("server.sim_tool")
@@ -251,6 +351,29 @@ class ProjectTools:
             if exc.name in {"server.sim_tool", "sim_tool"}:
                 return None
             raise
+
+    def _adapter_path(self) -> Path:
+        return self._resolve_within("adapter.json")
+
+    def _read_adapter_manifest(self) -> dict[str, Any]:
+        path = self._adapter_path()
+        if not path.is_file():
+            raise ProjectToolError("adapter.json is unavailable; create an adapter draft first")
+        manifest = self._read_json(path, "adapter manifest")
+        if not isinstance(manifest, dict):
+            raise ProjectToolError("adapter manifest must be an object")
+        return manifest
+
+    def _declared_morphology(self) -> str:
+        spec_path = self._resolve_within("spec.json")
+        if not spec_path.is_file():
+            raise ProjectToolError("spec.json is required before creating an adapter")
+        spec = self._read_json(spec_path, "spec")
+        morphology = spec.get("morphology") if isinstance(spec, dict) else None
+        value = morphology.get("type") if isinstance(morphology, dict) else morphology
+        if not isinstance(value, str) or not _SAFE_MORPHOLOGY.fullmatch(value):
+            raise ProjectToolError("spec.json must declare a lowercase snake_case morphology")
+        return value
 
     def _invoke_simulator(
         self, simulator: Any, duration_s: float, mode: str, scenario: str

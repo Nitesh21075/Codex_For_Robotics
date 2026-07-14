@@ -42,6 +42,21 @@
       "name": "compare_runs",
       "description": "Compare task metrics between two recorded runs.",
       "input": {"type": "object", "additionalProperties": false, "properties": {"base_run_id": {"type": "string"}, "candidate_run_id": {"type": "string"}}, "required": ["base_run_id", "candidate_run_id"]}
+    },
+    {
+      "name": "get_adapter_capabilities",
+      "description": "List the approved project-local simulator families and their required assets.",
+      "input": {"type": "object", "additionalProperties": false, "properties": {}}
+    },
+    {
+      "name": "create_adapter_draft",
+      "description": "Create a data-only adapter declaration for the morphology already declared in spec.json.",
+      "input": {"type": "object", "additionalProperties": false, "properties": {"morphology": {"type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}$"}, "family": {"type": "string", "enum": ["rail_train_kinematic", "articulated_position_control"]}, "display_name": {"type": "string", "maxLength": 120}}, "required": ["morphology", "family"]}
+    },
+    {
+      "name": "validate_adapter_draft",
+      "description": "Run the adapter draft briefly and mark it validated only when it launches without crashing.",
+      "input": {"type": "object", "additionalProperties": false, "properties": {"duration_s": {"type": "number", "minimum": 0.1, "maximum": 15}}}
     }
   ],
   "event_envelope": {
@@ -55,4 +70,3 @@
     }
   }
 }
-

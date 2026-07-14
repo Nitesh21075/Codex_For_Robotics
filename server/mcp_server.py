@@ -81,6 +81,31 @@ def create_mcp_server(session_root: str | Path) -> Any:
             base_run_id=base_run_id, candidate_run_id=candidate_run_id
         )
 
+    @server.tool(
+        name="get_adapter_capabilities",
+        description="List the approved simulator families and workflow for declaring a project-local adapter.",
+    )
+    def get_adapter_capabilities() -> dict[str, Any]:
+        return tools.get_adapter_capabilities()
+
+    @server.tool(
+        name="create_adapter_draft",
+        description="Declare this project's new morphology against one approved simulator family. This is not runnable until validation succeeds.",
+    )
+    def create_adapter_draft(
+        morphology: str, family: str, display_name: str | None = None
+    ) -> dict[str, Any]:
+        return tools.create_adapter_draft(
+            morphology=morphology, family=family, display_name=display_name
+        )
+
+    @server.tool(
+        name="validate_adapter_draft",
+        description="Perform a real short simulator run for the declared adapter and promote it only if the adapter launches without crashing.",
+    )
+    def validate_adapter_draft(duration_s: float = 3.0) -> dict[str, Any]:
+        return tools.validate_adapter_draft(duration_s=duration_s)
+
     return server
 
 

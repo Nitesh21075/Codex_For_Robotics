@@ -301,7 +301,11 @@ def _agent_prompt(user_text: str, *, autonomous: bool = False) -> str:
         )
     return (
         "RoboPilot workspace rule: the platform can run differential-drive, articulated-hand/arm, "
-        "and rail_train projects through validated built-in adapters. For ordinary differential-drive motion requests, prefer "
+        "and rail_train projects through validated built-in adapters. If the user asks for a new "
+        "morphology, first use get_adapter_capabilities. You may map it only to an approved project-local "
+        "adapter family by updating spec.json, creating the needed project assets, calling "
+        "create_adapter_draft, and then validate_adapter_draft. Do not claim an adapter is usable until "
+        "that tool returns validated=true; do not attempt to edit RoboPilot server internals. For ordinary differential-drive motion requests, prefer "
         "editing mission.json before rewriting controller.py. Use controller.py when a new "
         "algorithm is genuinely needed. You may edit any project files required by the user, "
         "and must only claim a simulation was run after a RoboPilot tool returns a run record. "
@@ -329,14 +333,37 @@ def _project_preview(session: Any) -> dict[str, Any]:
         "quadruped": "PyBullet articulated position-control",
         "rail_train": "PyBullet kinematic rail-train",
     }.get(kind)
+    adapter_manifest: dict[str, Any] = {}
+    try:
+        raw_manifest = json.loads((session.workspace / "adapter.json").read_text(encoding="utf-8"))
+        adapter_manifest = raw_manifest if isinstance(raw_manifest, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        pass
+    declared_family = adapter_manifest.get("family")
+    is_validated = (
+        adapter_manifest.get("morphology") == kind
+        and adapter_manifest.get("status") == "validated"
+        and declared_family in {"rail_train_kinematic", "articulated_position_control"}
+    )
+    if adapter is None and is_validated:
+        adapter = {
+            "rail_train_kinematic": "PyBullet kinematic rail-train",
+            "articulated_position_control": "PyBullet articulated position-control",
+        }[declared_family]
     can_run = adapter is not None
+    if adapter is None and adapter_manifest.get("morphology") == kind and adapter_manifest.get("status") == "draft":
+        message = f"Adapter draft for '{kind}' is awaiting validation; Codex must validate it before normal runs."
+    elif adapter:
+        message = f"{adapter} adapter ready."
+    else:
+        message = f"No simulator adapter is installed for '{kind}'. This project remains editable and previewable."
     return {
         "type": "project_preview",
         "project_id": session.project_id,
         "title": title,
         "morphology": kind,
         "can_run": can_run,
-        "message": f"{adapter} adapter ready." if adapter else f"No simulator adapter is installed for '{kind}'. This project remains editable and previewable.",
+        "message": message,
     }
 
 
