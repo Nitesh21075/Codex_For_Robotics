@@ -29,3 +29,23 @@ def test_matching_simulator_adapters_are_marked_runnable(tmp_path: Path) -> None
 
     (hand.workspace / "spec.json").write_text(json.dumps({"morphology": "underwater_vehicle"}), encoding="utf-8")
     assert _project_preview(hand)["can_run"] is False
+
+
+def test_validated_project_local_adapter_is_runnable_but_draft_is_not(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path / "sessions")
+    project = store.create_fresh_project("monorail")[0]
+    (project.workspace / "spec.json").write_text(
+        json.dumps({"morphology": "airport_monorail"}), encoding="utf-8"
+    )
+    (project.workspace / "adapter.json").write_text(
+        json.dumps({"morphology": "airport_monorail", "family": "rail_train_kinematic", "status": "draft"}),
+        encoding="utf-8",
+    )
+    assert _project_preview(project)["can_run"] is False
+    assert "awaiting validation" in _project_preview(project)["message"]
+
+    (project.workspace / "adapter.json").write_text(
+        json.dumps({"morphology": "airport_monorail", "family": "rail_train_kinematic", "status": "validated"}),
+        encoding="utf-8",
+    )
+    assert _project_preview(project)["can_run"] is True

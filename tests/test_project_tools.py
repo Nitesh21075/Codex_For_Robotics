@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -68,3 +69,39 @@ def test_tool_rejects_invalid_run_parameters(tmp_path: Path) -> None:
         tools.run_project(0, "batch", "default")
     with pytest.raises(ProjectToolError):
         tools.run_project(1, "interactive", "default")
+
+
+def test_agent_can_declare_and_validate_a_project_local_rail_adapter(tmp_path: Path) -> None:
+    workspace = tmp_path / "monorail"
+    workspace.mkdir()
+    (workspace / "spec.json").write_text(
+        json.dumps({"name": "Airport monorail", "morphology": "airport_monorail"}),
+        encoding="utf-8",
+    )
+    (workspace / "mission.json").write_text(
+        json.dumps({"route": [{"node": "terminal", "distance_m": 0}, {"node": "gate", "distance_m": 5}]}),
+        encoding="utf-8",
+    )
+    tools = ProjectTools(workspace)
+
+    capabilities = tools.get_adapter_capabilities()
+    assert {entry["family"] for entry in capabilities["families"]} == {
+        "articulated_position_control",
+        "rail_train_kinematic",
+    }
+    draft = tools.create_adapter_draft("airport_monorail", "rail_train_kinematic")
+    assert draft["adapter"]["status"] == "draft"
+
+    validation = tools.validate_adapter_draft(0.2)
+
+    assert validation["validated"] is True
+    assert validation["run"]["adapter"] == "rail_train_kinematic"
+    assert json.loads((workspace / "adapter.json").read_text(encoding="utf-8"))["status"] == "validated"
+
+
+def test_adapter_draft_must_match_the_spec_morphology(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "spec.json").write_text(json.dumps({"morphology": "custom_hand"}), encoding="utf-8")
+    with pytest.raises(ProjectToolError, match="declares morphology"):
+        ProjectTools(workspace).create_adapter_draft("custom_arm", "articulated_position_control")
