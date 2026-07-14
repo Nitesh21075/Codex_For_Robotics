@@ -53,7 +53,7 @@ _FRESH_PROJECT_FILES = {
     "PROJECT.md": "# New robotics project\n\nDescribe the robot and task in chat to have Codex scaffold this workspace.\n",
     "AGENTS.md": """# RoboPilot fresh-project guidance
 
-This workspace starts empty on purpose. For the user's first request, create a concise `spec.json`, a README, and the code/assets needed to express the requested robot and task. Explain what was created. The currently installed PyBullet adapter can execute the differential-drive rover template only; for another morphology such as an arm, scaffold the project honestly and state that a matching simulator adapter is still needed before running physics. Do not claim a simulation was run unless the RoboPilot tool returned a run record.
+This workspace starts empty on purpose. For the user's first request, create a concise `spec.json`, a README, and the code/assets needed to express the requested robot and task. Explain what was created. Installed PyBullet adapters support differential-drive, articulated hands/arms, and kinematic `rail_train` projects. For another morphology, scaffold the project honestly and state that a matching simulator adapter is still needed before running physics. Do not claim a simulation was run unless the RoboPilot tool returned a run record.
 """,
 }
 

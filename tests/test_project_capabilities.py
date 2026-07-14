@@ -7,7 +7,7 @@ from server.main import _project_preview
 from server.session_store import ProjectStore
 
 
-def test_only_matching_simulator_adapter_is_marked_runnable(tmp_path: Path) -> None:
+def test_matching_simulator_adapters_are_marked_runnable(tmp_path: Path) -> None:
     store = ProjectStore(tmp_path / "sessions")
     rover = store.get_or_create("rover-demo")
     hand = store.create_fresh_project("robotic-hand")[0]
@@ -17,6 +17,15 @@ def test_only_matching_simulator_adapter_is_marked_runnable(tmp_path: Path) -> N
 
     assert _project_preview(rover)["can_run"] is True
     preview = _project_preview(hand)
-    assert preview["can_run"] is False
+    assert preview["can_run"] is True
     assert preview["morphology"] == "robotic_hand"
     assert "adapter" in preview["message"]
+
+    train = store.create_fresh_project("rail-train")[0]
+    (train.workspace / "spec.json").write_text(
+        json.dumps({"name": "Short train", "morphology": "rail_train"}), encoding="utf-8"
+    )
+    assert _project_preview(train)["can_run"] is True
+
+    (hand.workspace / "spec.json").write_text(json.dumps({"morphology": "underwater_vehicle"}), encoding="utf-8")
+    assert _project_preview(hand)["can_run"] is False

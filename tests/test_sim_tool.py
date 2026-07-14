@@ -37,6 +37,20 @@ class SimulatorTests(unittest.TestCase):
             saved = json.loads(Path(record["record_path"]).read_text(encoding="utf-8"))
             self.assertEqual(saved["run_id"], record["run_id"])
 
+    def test_rail_train_adapter_writes_canonical_evidence(self) -> None:
+        from server.sim_tool import run_simulation
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "spec.json").write_text(json.dumps({"name": "test train", "morphology": "rail_train"}), encoding="utf-8")
+            (workspace / "mission.json").write_text(json.dumps({"route": [{"node": "depot", "distance_m": 0}, {"node": "siding", "distance_m": 0.1}]}), encoding="utf-8")
+            (workspace / "train_controller.py").write_text("def compute_train_command(observation):\n    return {'throttle': 1.0, 'brake': 0.0}\n", encoding="utf-8")
+            record = run_simulation(workspace, duration_s=0.5)
+            self.assertEqual(record["adapter"], "rail_train_kinematic")
+            self.assertEqual(record["status"], "task_success")
+            self.assertGreaterEqual(len(record["evidence"]["frames"]), 2)
+            self.assertTrue(Path(record["record_path"]).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

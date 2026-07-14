@@ -300,7 +300,8 @@ def _agent_prompt(user_text: str, *, autonomous: bool = False) -> str:
             "without new evidence."
         )
     return (
-        "RoboPilot workspace rule: for ordinary differential-drive motion requests, prefer "
+        "RoboPilot workspace rule: the platform can run differential-drive, articulated-hand/arm, "
+        "and rail_train projects through validated built-in adapters. For ordinary differential-drive motion requests, prefer "
         "editing mission.json before rewriting controller.py. Use controller.py when a new "
         "algorithm is genuinely needed. You may edit any project files required by the user, "
         "and must only claim a simulation was run after a RoboPilot tool returns a run record. "
@@ -319,14 +320,23 @@ def _project_preview(session: Any) -> dict[str, Any]:
     kind = morphology.get("type") if isinstance(morphology, dict) else morphology
     kind = kind if isinstance(kind, str) else "unknown"
     title = spec.get("name") if isinstance(spec, dict) and isinstance(spec.get("name"), str) else session.project_id
-    can_run = kind == "differential_drive"
+    adapter = {
+        "differential_drive": "PyBullet differential-drive",
+        "robotic_hand": "PyBullet articulated position-control",
+        "robotic_arm_hand": "PyBullet articulated position-control",
+        "articulated_arm": "PyBullet articulated position-control",
+        "mobile_manipulator": "PyBullet articulated position-control",
+        "quadruped": "PyBullet articulated position-control",
+        "rail_train": "PyBullet kinematic rail-train",
+    }.get(kind)
+    can_run = adapter is not None
     return {
         "type": "project_preview",
         "project_id": session.project_id,
         "title": title,
         "morphology": kind,
         "can_run": can_run,
-        "message": "PyBullet differential-drive adapter ready." if can_run else f"No simulator adapter is installed for '{kind}'. This project remains editable and previewable.",
+        "message": f"{adapter} adapter ready." if adapter else f"No simulator adapter is installed for '{kind}'. This project remains editable and previewable.",
     }
 
 
@@ -365,7 +375,7 @@ async def _send_project_selected(project_id: str, *, created: bool = False, reci
         await _replay_recorded_run(session, str(runs[0]["run_id"]))
 
 
-async def _run_project(project_id: str, mode: str, duration_s: float = 10.0) -> None:
+async def _run_project(project_id: str, mode: str, duration_s: float | None = None) -> None:
     session = state.store.get_or_create(project_id)
     preview = _project_preview(session)
     if not preview["can_run"]:
@@ -378,7 +388,10 @@ async def _run_project(project_id: str, mode: str, duration_s: float = 10.0) -> 
             }
         )
         return
-    await state.broadcast({"type": "stage", "project_id": project_id, "stage": "observe", "status": "start", "note": f"Running the project in {mode} simulator mode."})
+    # A typical train route is materially longer than the rover target task.
+    # Batch mode remains fast; live mode intentionally mirrors this duration.
+    actual_duration_s = duration_s if duration_s is not None else (30.0 if preview["morphology"] == "rail_train" else 10.0)
+    await state.broadcast({"type": "stage", "project_id": project_id, "stage": "observe", "status": "start", "note": f"Running the project in {mode} simulator mode for {actual_duration_s:g} simulated seconds."})
     live_events_already_streamed = mode == "live"
     if live_events_already_streamed:
         loop = asyncio.get_running_loop()
@@ -393,14 +406,14 @@ async def _run_project(project_id: str, mode: str, duration_s: float = 10.0) -> 
         summary = await asyncio.to_thread(
             run_simulation,
             session.workspace,
-            duration_s=duration_s,
+            duration_s=actual_duration_s,
             mode="live",
             scenario="default",
             run_id=live_run_id,
             on_state=publish_live_state,
         )
     else:
-        summary = await asyncio.to_thread(session.tools.run_project, duration_s, mode, "default")
+        summary = await asyncio.to_thread(session.tools.run_project, actual_duration_s, mode, "default")
     run_id = summary["run_id"]
     if summary.get("status") == "crashed":
         await state.broadcast({"type": "run_summary", "project_id": project_id, **summary, "artifact_revision": session.revision_id})

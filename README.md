@@ -1,9 +1,10 @@
 # RoboPilot
 
-RoboPilot is a persistent, multimodal project workspace. The first adapter is a
-PyBullet differential-drive rover, but the platform boundary is a Codex agent
-that can edit a project, request targeted numerical or visual evidence, run it,
-and continue the same conversation.
+RoboPilot is a persistent, multimodal project workspace. Its validated PyBullet
+adapters cover differential-drive rovers, articulated hands/arms, and bounded
+kinematic rail trains. The platform boundary is a Codex agent that can edit a
+project, request targeted numerical or visual evidence, run it, and continue
+the same conversation.
 
 ## Local setup
 
@@ -53,6 +54,12 @@ seeking, circle motion, or explicit wheel velocities). Codex can still edit
 `controller.py` when a request needs a genuinely different algorithm. Each run
 is retained under `sessions/<project>/workspace/runs/` and can be selected from
 the recorded-run picker in the camera panel.
+
+`rail_train` is also runnable through a bounded PyBullet kinematic adapter.
+It consumes `mission.json` route nodes and an optional `train_controller.py`,
+and records traction, braking, speed, route progress, frames, and telemetry.
+It is intentionally not presented as high-fidelity wheel/rail or flexible
+coupler physics; those require a future dedicated dynamics adapter.
 
 ## Architecture
 

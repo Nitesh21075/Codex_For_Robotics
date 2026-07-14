@@ -128,9 +128,20 @@ def _load_spec(workspace: Path) -> dict[str, Any]:
     return normalize_spec(raw)
 
 
+def _project_morphology(workspace: Path) -> str:
+    """Read the declared robot class before applying the rover-only schema."""
+    try:
+        raw = json.loads((workspace / "spec.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "differential_drive"
+    morphology = raw.get("morphology") if isinstance(raw, Mapping) else None
+    kind = morphology.get("type") if isinstance(morphology, Mapping) else morphology
+    return kind if isinstance(kind, str) else "unknown"
+
+
 def _artifact_revision(workspace: Path) -> str:
     digest = hashlib.sha256()
-    for name in ("spec.json", "robot.urdf", "controller.py", "mission.json"):
+    for name in ("spec.json", "robot.urdf", "controller.py", "train_controller.py", "mission.json"):
         path = workspace / name
         digest.update(name.encode("utf-8"))
         if path.exists():
@@ -247,6 +258,28 @@ def run_simulation(
 
     workspace_path = Path(workspace).resolve()
     workspace_path.mkdir(parents=True, exist_ok=True)
+    morphology_kind = _project_morphology(workspace_path)
+    if morphology_kind == "rail_train":
+        return run_rail_train_simulation(
+            workspace_path,
+            duration_s=duration_s,
+            mode=mode,
+            scenario=scenario,
+            run_id=run_id,
+            artifact_revision=artifact_revision,
+            on_state=on_state,
+        )
+    if morphology_kind != "differential_drive":
+        return run_articulated_simulation(
+            workspace_path,
+            morphology=morphology_kind,
+            duration_s=duration_s,
+            mode=mode,
+            scenario=scenario,
+            run_id=run_id,
+            artifact_revision=artifact_revision,
+            on_state=on_state,
+        )
     spec = _load_spec(workspace_path)
     urdf_path = workspace_path / "robot.urdf"
     if not urdf_path.exists():
@@ -455,6 +488,306 @@ def run_simulation(
     record_path = run_dir / "run_record.json"
     record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     record["record_path"] = str(record_path)
+    return record
+
+
+def _articulated_targets(controller_path: Path, joint_names: list[str], positions: dict[str, float]) -> dict[str, float]:
+    """Support a small, explicit joint-target ABI plus the bundled hand controller."""
+    module_name = f"robopilot_articulated_{uuid.uuid4().hex}"
+    module_spec = importlib.util.spec_from_file_location(module_name, controller_path)
+    if module_spec is None or module_spec.loader is None:
+        return positions
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    compute = getattr(module, "compute_joint_targets", None)
+    if callable(compute):
+        value = compute({"joint_position": positions, "joint_names": joint_names})
+        if isinstance(value, Mapping):
+            return {name: float(value[name]) for name in joint_names if name in value}
+    targets = getattr(module, "JOINT_TARGETS", None)
+    if isinstance(targets, Mapping):
+        return {name: float(targets[name]) for name in joint_names if name in targets}
+    hand_type = getattr(module, "HandController", None)
+    if hand_type is not None:
+        hand = hand_type()
+        close_pose = getattr(hand, "close_pose", None)
+        if callable(close_pose):
+            hand.set_target(close_pose())
+            ordered = getattr(module, "JOINTS", ())
+            return {name: float(value) for name, value in zip(ordered, hand.command()) if name in joint_names}
+    return positions
+
+
+def _articulated_camera(bullet: Any, robot_id: int, frame_path: Path) -> None:
+    position, _ = bullet.getBasePositionAndOrientation(robot_id)
+    eye = [position[0] + 0.65, position[1] - 0.65, position[2] + 0.5]
+    view = bullet.computeViewMatrix(eye, [position[0], position[1], position[2] + 0.2], [0.0, 0.0, 1.0])
+    projection = bullet.computeProjectionMatrixFOV(fov=58, aspect=FRAME_WIDTH / FRAME_HEIGHT, nearVal=0.03, farVal=5.0)
+    _, _, rgba, _, _ = bullet.getCameraImage(FRAME_WIDTH, FRAME_HEIGHT, viewMatrix=view, projectionMatrix=projection, renderer=bullet.ER_TINY_RENDERER)
+    Image.fromarray(np.asarray(rgba, dtype=np.uint8).reshape((FRAME_HEIGHT, FRAME_WIDTH, 4))[:, :, :3], mode="RGB").save(frame_path, format="JPEG", quality=88)
+
+
+def run_articulated_simulation(
+    workspace: Path,
+    *,
+    morphology: str,
+    duration_s: float,
+    mode: str,
+    scenario: str,
+    run_id: str | None,
+    artifact_revision: str | None,
+    on_state: Callable[[dict[str, Any], dict[str, Any]], None] | None,
+) -> dict[str, Any]:
+    """Generic position-control adapter for arm, hand, mobile-manipulator and legged URDFs."""
+    supported = {"robotic_hand", "robotic_arm_hand", "articulated_arm", "mobile_manipulator", "quadruped"}
+    if morphology not in supported:
+        raise ValueError(f"no simulator adapter is installed for morphology '{morphology}'")
+    urdfs = [workspace / "robot.urdf", *sorted((workspace / "model").glob("*.urdf"))]
+    urdf_path = next((path for path in urdfs if path.is_file()), None)
+    if urdf_path is None:
+        raise FileNotFoundError("articulated adapter requires a project URDF in model/ or robot.urdf")
+    actual_run_id = run_id or f"run_{uuid.uuid4().hex[:12]}"
+    run_dir, frames_dir = workspace / "runs" / actual_run_id, workspace / "runs" / actual_run_id / "frames"
+    if run_dir.exists():
+        raise FileExistsError(f"run already exists: {actual_run_id}")
+    frames_dir.mkdir(parents=True)
+    bullet, pybullet_data = _require_pybullet()
+    client_id = bullet.connect(bullet.DIRECT)
+    signals: list[dict[str, Any]] = []
+    states: list[dict[str, Any]] = []
+    frames: list[dict[str, Any]] = []
+    stderr, status, controller_log = "", "task_failed", io.StringIO()
+    started = time.monotonic()
+    try:
+        bullet.resetSimulation(physicsClientId=client_id)
+        bullet.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
+        # This adapter validates commanded joint motion; it is deliberately
+        # kinematic until a morphology-specific dynamics/contact model is added.
+        bullet.setGravity(0, 0, 0, physicsClientId=client_id)
+        bullet.setTimeStep(SIM_DT, physicsClientId=client_id)
+        bullet.loadURDF("plane.urdf", physicsClientId=client_id)
+        robot_id = bullet.loadURDF(str(urdf_path), [0, 0, 0.04], useFixedBase=True, physicsClientId=client_id)
+        joint_indices = {bullet.getJointInfo(robot_id, index, physicsClientId=client_id)[1].decode("utf-8"): index for index in range(bullet.getNumJoints(robot_id, physicsClientId=client_id))}
+        movable = [name for name, index in joint_indices.items() if bullet.getJointInfo(robot_id, index, physicsClientId=client_id)[2] != bullet.JOINT_FIXED]
+        if not movable:
+            raise RuntimeError("articulated adapter requires at least one movable joint")
+        initial = {name: float(bullet.getJointState(robot_id, joint_indices[name], physicsClientId=client_id)[0]) for name in movable}
+        controller_path = workspace / "controller.py"
+        targets = _articulated_targets(controller_path, movable, initial) if controller_path.is_file() else initial
+        targets = {name: max(-6.28, min(6.28, value)) for name, value in targets.items()}
+        indices, values = [joint_indices[name] for name in targets], list(targets.values())
+        total_steps, sample_every = max(1, int(round(duration_s / SIM_DT))), max(1, int(round((1 / SAMPLE_HZ) / SIM_DT)))
+        frame_steps = {0, total_steps // 2, total_steps - 1}
+        for step in range(total_steps):
+            bullet.setJointMotorControlArray(robot_id, indices, bullet.POSITION_CONTROL, targetPositions=values, forces=[50.0] * len(indices), physicsClientId=client_id)
+            bullet.stepSimulation(physicsClientId=client_id)
+            if step % sample_every == 0 or step == total_steps - 1:
+                position, quat = bullet.getBasePositionAndOrientation(robot_id, physicsClientId=client_id)
+                current = {name: float(bullet.getJointState(robot_id, joint_indices[name], physicsClientId=client_id)[0]) for name in movable}
+                velocity = {name: float(bullet.getJointState(robot_id, joint_indices[name], physicsClientId=client_id)[1]) for name in movable}
+                error = max((abs(current[name] - targets.get(name, current[name])) for name in movable), default=0.0)
+                sample = {"t": round((step + 1) * SIM_DT, 6), "base_pos": [float(v) for v in position], "base_quat": [float(v) for v in quat], "joints": current}
+                signal = {"t": sample["t"], "joint_target_error_rad": error, "dist_to_target_m": error, "yaw_rad": _yaw(quat, bullet), "joint_velocity_rad_s": max((abs(v) for v in velocity.values()), default=0.0)}
+                states.append(sample); signals.append(signal)
+                if on_state: on_state(sample, signal)
+            if step in frame_steps:
+                frame_path = frames_dir / f"robot_rgb_{step:06d}.jpg"; _articulated_camera(bullet, robot_id, frame_path)
+                frames.append({"camera": "robot_rgb", "t": round((step + 1) * SIM_DT, 6), "path": str(frame_path)})
+            if mode == "live": time.sleep(max(0.0, started + (step + 1) * SIM_DT - time.monotonic()))
+        status = "task_success" if signals and signals[-1]["joint_target_error_rad"] < 0.08 else "task_failed"
+    except Exception:
+        status, stderr = "crashed", traceback.format_exc(limit=12)
+    finally:
+        if client_id >= 0: bullet.disconnect(physicsClientId=client_id)
+    summary = {"final_base_pose": {"xyz": states[-1]["base_pos"] if states else [0, 0, 0], "rpy": [0, 0, 0]}, "distance_to_target_m": signals[-1]["dist_to_target_m"] if signals else None, "collisions": 0, "max_tilt_deg": 0.0, "sim_time_s": signals[-1]["t"] if signals else 0.0}
+    _write_jsonl(run_dir / "signals.jsonl", signals); _write_jsonl(run_dir / "states.jsonl", states)
+    (run_dir / "controller.log").write_text(controller_log.getvalue(), encoding="utf-8")
+    record = {"schema_version": "0.1.0", "run_id": actual_run_id, "artifact_revision": artifact_revision or _artifact_revision(workspace), "status": status, "stderr": stderr[:2000], "telemetry_summary": summary, "evidence": {"frames": frames, "signals_path": str(run_dir / "signals.jsonl")}, "state_samples_path": str(run_dir / "states.jsonl"), "mode": mode, "scenario": scenario, "adapter": "articulated_position_control"}
+    record_path = run_dir / "run_record.json"; record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8"); record["record_path"] = str(record_path)
+    return record
+
+
+def _rail_mission(workspace: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read a bounded one-dimensional route from a train project mission."""
+    try:
+        mission = json.loads((workspace / "mission.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        mission = {}
+    route = mission.get("route") if isinstance(mission, Mapping) else None
+    rows = [row for row in route if isinstance(row, Mapping)] if isinstance(route, list) else []
+    if not rows:
+        rows = [{"node": "depot", "distance_m": 0.0}, {"node": "destination", "distance_m": 20.0}]
+    normalised: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        try:
+            distance = max(0.0, float(row.get("distance_m", index * 10.0)))
+        except (TypeError, ValueError):
+            distance = index * 10.0
+        normalised.append({"node": str(row.get("node") or f"node_{index}"), "distance_m": distance})
+    normalised.sort(key=lambda row: float(row["distance_m"]))
+    consist = mission.get("consist") if isinstance(mission, Mapping) else None
+    cars = consist.get("cars") if isinstance(consist, Mapping) else None
+    car_names = [str(car) for car in cars] if isinstance(cars, list) else ["C-01", "C-02", "C-03"]
+    return normalised, car_names
+
+
+def _rail_controller(workspace: Path, route: list[dict[str, Any]]) -> Callable[[dict[str, Any]], Mapping[str, Any]]:
+    """Load a project route controller, falling back to a conservative throttle."""
+    path = workspace / "train_controller.py"
+    if not path.is_file():
+        return lambda _: {"throttle": 0.6, "brake": 0.0}
+    module_name = f"robopilot_rail_controller_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load train_controller.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    direct = getattr(module, "compute_train_command", None)
+    if callable(direct):
+        return direct
+    state_type = getattr(module, "TrainState", None)
+    controller_type = getattr(module, "YardShuttleController", None)
+    if callable(state_type) and callable(controller_type):
+        try:
+            mission = json.loads((workspace / "mission.json").read_text(encoding="utf-8"))
+            controller = controller_type(mission)
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return lambda _: {"throttle": 0.6, "brake": 0.0}
+
+        def command(observation: dict[str, Any]) -> Mapping[str, Any]:
+            state = state_type(
+                observation["track"]["node"],
+                observation["odometry"]["position_m"],
+                observation["odometry"]["speed_mps"],
+                coupler_ok=observation["safety"]["coupler_ok"],
+                brake_pressure_ok=observation["safety"]["brake_pressure_ok"],
+            )
+            result = controller.command(state)
+            return result if isinstance(result, Mapping) else {}
+
+        return command
+    return lambda _: {"throttle": 0.6, "brake": 0.0}
+
+
+def _rail_camera(bullet: Any, locomotive_id: int, frame_path: Path) -> None:
+    position, _ = bullet.getBasePositionAndOrientation(locomotive_id)
+    eye = [position[0] - 3.2, position[1] - 4.0, 2.5]
+    target = [position[0] + 1.8, position[1], 0.35]
+    view = bullet.computeViewMatrix(eye, target, [0.0, 0.0, 1.0])
+    projection = bullet.computeProjectionMatrixFOV(fov=57, aspect=FRAME_WIDTH / FRAME_HEIGHT, nearVal=0.03, farVal=80.0)
+    _, _, rgba, _, _ = bullet.getCameraImage(FRAME_WIDTH, FRAME_HEIGHT, viewMatrix=view, projectionMatrix=projection, renderer=bullet.ER_TINY_RENDERER)
+    Image.fromarray(np.asarray(rgba, dtype=np.uint8).reshape((FRAME_HEIGHT, FRAME_WIDTH, 4))[:, :, :3], mode="RGB").save(frame_path, format="JPEG", quality=88)
+
+
+def run_rail_train_simulation(
+    workspace: Path,
+    *,
+    duration_s: float,
+    mode: str,
+    scenario: str,
+    run_id: str | None,
+    artifact_revision: str | None,
+    on_state: Callable[[dict[str, Any], dict[str, Any]], None] | None,
+) -> dict[str, Any]:
+    """Run the bounded kinematic rail-train adapter with visual/numerical evidence.
+
+    This adapter owns a one-dimensional, fixed-order consist. It deliberately
+    does not claim wheel/rail contact, derailment, or flexible coupler physics;
+    those require a later high-fidelity adapter. It does provide real PyBullet
+    scene frames, train-specific commands, and a durable evidence record.
+    """
+    actual_run_id = run_id or f"run_{uuid.uuid4().hex[:12]}"
+    run_dir, frames_dir = workspace / "runs" / actual_run_id, workspace / "runs" / actual_run_id / "frames"
+    if run_dir.exists():
+        raise FileExistsError(f"run already exists: {actual_run_id}")
+    frames_dir.mkdir(parents=True)
+    route, cars = _rail_mission(workspace)
+    destination = float(route[-1]["distance_m"])
+    controller = _rail_controller(workspace, route)
+    bullet, pybullet_data = _require_pybullet()
+    client_id = bullet.connect(bullet.DIRECT)
+    signals: list[dict[str, Any]] = []
+    states: list[dict[str, Any]] = []
+    frames: list[dict[str, Any]] = []
+    status, stderr = "task_failed", ""
+    started = time.monotonic()
+    try:
+        bullet.resetSimulation(physicsClientId=client_id)
+        bullet.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client_id)
+        bullet.setGravity(0, 0, -9.81, physicsClientId=client_id)
+        bullet.setTimeStep(SIM_DT, physicsClientId=client_id)
+        bullet.loadURDF("plane.urdf", physicsClientId=client_id)
+        track_length = max(20.0, destination + 8.0)
+        rail_shape = bullet.createVisualShape(bullet.GEOM_BOX, halfExtents=[track_length / 2.0, 0.025, 0.03], rgbaColor=[0.25, 0.28, 0.32, 1.0], physicsClientId=client_id)
+        for y in (-0.32, 0.32):
+            bullet.createMultiBody(baseMass=0.0, baseVisualShapeIndex=rail_shape, basePosition=[track_length / 2.0, y, 0.05], physicsClientId=client_id)
+        tie_shape = bullet.createVisualShape(bullet.GEOM_BOX, halfExtents=[0.12, 0.55, 0.035], rgbaColor=[0.42, 0.29, 0.18, 1.0], physicsClientId=client_id)
+        for distance in np.arange(0.0, track_length + 0.1, 0.8):
+            bullet.createMultiBody(baseMass=0.0, baseVisualShapeIndex=tie_shape, basePosition=[float(distance), 0.0, 0.02], physicsClientId=client_id)
+        locomotive_shape = bullet.createVisualShape(bullet.GEOM_BOX, halfExtents=[0.72, 0.28, 0.22], rgbaColor=[0.18, 0.34, 0.78, 1.0], physicsClientId=client_id)
+        car_shape = bullet.createVisualShape(bullet.GEOM_BOX, halfExtents=[0.62, 0.26, 0.18], rgbaColor=[0.68, 0.22, 0.16, 1.0], physicsClientId=client_id)
+        locomotive_id = bullet.createMultiBody(baseMass=0.0, baseVisualShapeIndex=locomotive_shape, basePosition=[0.0, 0.0, 0.32], physicsClientId=client_id)
+        car_ids = [bullet.createMultiBody(baseMass=0.0, baseVisualShapeIndex=car_shape, basePosition=[-1.5 - index * 1.35, 0.0, 0.28], physicsClientId=client_id) for index in range(len(cars))]
+        total_steps, sample_every = max(1, int(round(duration_s / SIM_DT))), max(1, int(round((1 / SAMPLE_HZ) / SIM_DT)))
+        frame_steps = {0, total_steps // 2, total_steps - 1}
+        position_m, speed_mps, throttle, brake = 0.0, 0.0, 0.0, 0.0
+        final_step = 0
+        for step in range(total_steps):
+            node = max((item for item in route if float(item["distance_m"]) <= position_m), key=lambda item: float(item["distance_m"]), default=route[0])
+            observation = {
+                "t": round(step * SIM_DT, 6),
+                "odometry": {"position_m": position_m, "speed_mps": speed_mps},
+                "track": {"node": node["node"], "destination_m": destination},
+                "safety": {"coupler_ok": True, "brake_pressure_ok": True},
+            }
+            command = controller(observation)
+            if not isinstance(command, Mapping):
+                raise TypeError("train controller must return a command mapping")
+            throttle = max(0.0, min(1.0, float(command.get("throttle", command.get("traction", 0.6)))))
+            brake = max(0.0, min(1.0, float(command.get("brake", 0.0))))
+            acceleration = throttle * 1.8 - brake * 3.2 - speed_mps * 0.12
+            speed_mps = max(0.0, min(12.0, speed_mps + acceleration * SIM_DT))
+            position_m = min(destination, position_m + speed_mps * SIM_DT)
+            bullet.resetBasePositionAndOrientation(locomotive_id, [position_m, 0.0, 0.32], [0.0, 0.0, 0.0, 1.0], physicsClientId=client_id)
+            for index, car_id in enumerate(car_ids):
+                bullet.resetBasePositionAndOrientation(car_id, [position_m - 1.5 - index * 1.35, 0.0, 0.28], [0.0, 0.0, 0.0, 1.0], physicsClientId=client_id)
+            bullet.stepSimulation(physicsClientId=client_id)
+            if step % sample_every == 0 or step == total_steps - 1:
+                distance = max(0.0, destination - position_m)
+                sample = {"t": round((step + 1) * SIM_DT, 6), "base_pos": [position_m, 0.0, 0.32], "base_quat": [0.0, 0.0, 0.0, 1.0], "joints": {"train_speed_mps": speed_mps}}
+                signal = {"t": sample["t"], "dist_to_target_m": distance, "yaw_rad": 0.0, "train_speed_mps": speed_mps, "traction": throttle, "brake": brake, "route_progress_m": position_m, "coupler_ok": 1.0}
+                states.append(sample); signals.append(signal)
+                if on_state: on_state(sample, signal)
+            if step in frame_steps:
+                frame_path = frames_dir / f"robot_rgb_{step:06d}.jpg"
+                _rail_camera(bullet, locomotive_id, frame_path)
+                frames.append({"camera": "robot_rgb", "t": round((step + 1) * SIM_DT, 6), "path": str(frame_path), "source": "rail_train_kinematic"})
+            if position_m >= destination - 0.25 and speed_mps < 0.12:
+                status = "task_success"
+                final_step = step
+                break
+            if mode == "live": time.sleep(max(0.0, started + (step + 1) * SIM_DT - time.monotonic()))
+            final_step = step
+        final_t = round((final_step + 1) * SIM_DT, 6)
+        if not signals or signals[-1]["t"] < final_t:
+            distance = max(0.0, destination - position_m)
+            states.append({"t": final_t, "base_pos": [position_m, 0.0, 0.32], "base_quat": [0.0, 0.0, 0.0, 1.0], "joints": {"train_speed_mps": speed_mps}})
+            signals.append({"t": final_t, "dist_to_target_m": distance, "yaw_rad": 0.0, "train_speed_mps": speed_mps, "traction": throttle, "brake": brake, "route_progress_m": position_m, "coupler_ok": 1.0})
+        if len(frames) < 2 or frames[-1]["t"] < final_t:
+            frame_path = frames_dir / "robot_rgb_final.jpg"
+            _rail_camera(bullet, locomotive_id, frame_path)
+            frames.append({"camera": "robot_rgb", "t": final_t, "path": str(frame_path), "source": "rail_train_kinematic"})
+        if signals and max(0.0, destination - position_m) <= 0.25:
+            status = "task_success"
+    except Exception:
+        status, stderr = "crashed", traceback.format_exc(limit=12)
+    finally:
+        if client_id >= 0: bullet.disconnect(physicsClientId=client_id)
+    summary = {"final_base_pose": {"xyz": states[-1]["base_pos"] if states else [0, 0, 0], "rpy": [0, 0, 0]}, "distance_to_target_m": signals[-1]["dist_to_target_m"] if signals else None, "collisions": 0, "max_tilt_deg": 0.0, "sim_time_s": signals[-1]["t"] if signals else 0.0, "train_speed_mps": signals[-1]["train_speed_mps"] if signals else 0.0, "route_progress_m": signals[-1]["route_progress_m"] if signals else 0.0}
+    _write_jsonl(run_dir / "signals.jsonl", signals); _write_jsonl(run_dir / "states.jsonl", states)
+    (run_dir / "controller.log").write_text("", encoding="utf-8")
+    record = {"schema_version": "0.1.0", "run_id": actual_run_id, "artifact_revision": artifact_revision or _artifact_revision(workspace), "status": status, "stderr": stderr[:2000], "telemetry_summary": summary, "evidence": {"frames": frames, "signals_path": str(run_dir / "signals.jsonl")}, "state_samples_path": str(run_dir / "states.jsonl"), "mode": mode, "scenario": scenario, "adapter": "rail_train_kinematic"}
+    record_path = run_dir / "run_record.json"; record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8"); record["record_path"] = str(record_path)
     return record
 
 
