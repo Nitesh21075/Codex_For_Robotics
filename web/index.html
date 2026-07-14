@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>RoboPilot — Project cockpit</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="RoboPilot home"><span class="brand-mark">R</span>RoboPilot</a>
+        <div class="project-title">
+          <span class="eyebrow">PROJECT</span>
+          <div class="project-picker"><select id="projectSelect" aria-label="Select project"></select><button class="icon-button" id="newProjectButton" title="Create a new project" aria-label="Create a new project">+</button></div>
+          <div class="chat-session-picker"><select id="chatSessionSelect" aria-label="Select conversation"></select><button class="icon-button" id="newChatSessionButton" title="Start a new conversation" aria-label="Start a new conversation">+</button></div>
+          <span class="revision" id="revisionBadge">rev_17</span>
+        </div>
+        <div class="run-status" id="runStatus"><span class="status-dot"></span><span>Ready</span></div>
+        <div class="header-actions">
+          <label class="model-select">Model <select id="modelSelect" aria-label="Codex model"><option value="gpt-5.6-luna:low">GPT-5.6 Luna · low effort</option><option value="gpt-5.6-luna:medium" selected>GPT-5.6 Luna · medium effort</option><option value="gpt-5.6-luna:high">GPT-5.6 Luna · high effort</option><option value="gpt-5.6-luna:xhigh">GPT-5.6 Luna · extra-high effort</option><option value="gpt-5.6-terra:low">GPT-5.6 Terra · low effort</option><option value="gpt-5.6-terra:medium">GPT-5.6 Terra · medium effort</option><option value="gpt-5.6-terra:high">GPT-5.6 Terra · high effort</option><option value="gpt-5.6-terra:xhigh">GPT-5.6 Terra · extra-high effort</option><option value="gpt-5.5">GPT-5.5 · flagship</option></select></label>
+          <button class="button button-primary" id="runButton">Run</button>
+          <button class="button" id="stopButton" disabled>Stop</button>
+          <button class="button" id="continueButton" title="Up to six evidence-driven recovery attempts">Continue autonomously</button>
+          <label class="mode-toggle" title="Choose simulator mode">
+            <input id="modeToggle" type="checkbox" />
+            <span>Batch</span><span>Live</span>
+          </label>
+          <button class="button" id="compareButton">Compare runs</button>
+        </div>
+      </header>
+
+      <section class="workbench">
+        <aside class="left-panel panel">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">PERSISTENT CONVERSATION</span>
+              <h1>Build with RoboPilot</h1>
+            </div>
+          </div>
+          <div class="stage-row" id="stageRow" aria-label="Pipeline stages"></div>
+          <div class="stage-note" id="stageNote">Waiting for Codex activity.</div>
+          <div class="conversation" id="conversation" aria-live="polite"></div>
+          <div class="agent-working done" id="agentWorking" aria-live="polite"><i></i><span id="agentWorkingText">Codex is idle.</span></div>
+          <div class="activity-wrap" title="Scroll activity or drag the lower-right corner to resize it vertically">
+            <div class="section-label">ACTIVITY</div>
+            <ol class="activity" id="activity"></ol>
+          </div>
+          <form class="composer" id="chatForm">
+            <textarea id="chatInput" rows="3" placeholder="Describe what to change…"></textarea>
+            <div class="composer-footer"><span>⌘ ↵ to send</span><button class="button button-primary" type="submit">Send</button></div>
+          </form>
+        </aside>
+
+        <section class="center-panel">
+          <section class="viewport-card panel">
+            <div class="panel-heading compact">
+              <div><span class="eyebrow">SIMULATOR</span><h2 id="runLabel">No active run</h2></div>
+              <div class="legend"><span><i class="legend-rover"></i>Rover</span><span><i class="legend-target"></i>Target</span></div>
+            </div>
+            <div class="canvas-wrap"><canvas id="simCanvas" aria-label="Top-down simulator replay"></canvas><div class="viewport-note" id="viewportNote">Current project preview</div></div>
+            <div class="playback"><button class="play-button" id="playButton" aria-label="Play or pause replay">▶</button><input id="timeline" type="range" min="0" max="100" value="0" aria-label="Simulation timeline" /><output id="timeReadout">t = 0.00 s</output><button class="subtle-button" id="resetViewButton">Reset view</button></div>
+          </section>
+          <section class="evidence-row">
+            <article class="evidence-card panel">
+              <div class="panel-heading compact"><div><span class="eyebrow">ROBOT RGB</span><h2>Camera evidence</h2></div><select class="run-picker" id="recordedRunSelect" aria-label="Select recorded simulation run"><option value="">No recorded runs</option></select></div>
+              <canvas id="cameraCanvas" aria-label="Robot camera evidence"></canvas>
+              <div class="evidence-meta" id="frameMeta">No frame selected</div>
+            </article>
+            <article class="telemetry-card panel">
+              <div class="panel-heading compact"><div><span class="eyebrow">TELEMETRY</span><h2>Distance to target</h2></div><strong id="metricValue">—</strong></div>
+              <canvas id="telemetryCanvas" aria-label="Distance-to-target telemetry chart"></canvas>
+              <div class="chart-legend"><span><i></i>dist_to_target (m)</span><span id="telemetryTime">waiting for run</span></div>
+            </article>
+          </section>
+        </section>
+
+        <aside class="right-panel panel" id="workspacePanel">
+          <div class="panel-heading compact"><div><span class="eyebrow">WORKSPACE</span><h2>Files &amp; revisions</h2></div><span class="revision" id="fileRevision">rev_17</span><button class="icon-button" id="toggleWorkspace" title="Collapse workspace" aria-label="Collapse workspace" aria-expanded="true">›</button></div>
+          <section class="file-explorer" id="fileExplorer">
+            <div class="explorer-heading"><span class="section-label">FILES</span><button class="subtle-button" id="toggleFileTree" aria-expanded="true">Collapse</button></div>
+            <nav class="file-tree" id="fileTree" aria-label="Project file tree"></nav>
+          </section>
+          <div class="file-meta"><span id="filePath">controller.py</span><span id="lineHint">editable</span></div>
+          <textarea id="codeEditor" class="code-editor" spellcheck="false" aria-label="Editable project file"></textarea>
+          <div class="editor-actions"><span id="editStatus">Agent changes appear here.</span><button class="button" id="saveFileButton">Save revision</button></div>
+          <section class="diff-section">
+            <div class="section-label">LATEST CHANGE</div>
+            <pre id="diffView" class="diff-view">No file changes in this revision.</pre>
+          </section>
+          <section class="run-summary">
+            <div class="section-label">RUN EVIDENCE</div>
+            <dl id="runEvidence"><div><dt>Run</dt><dd>—</dd></div><div><dt>Artifact</dt><dd>—</dd></div><div><dt>Collisions</dt><dd>—</dd></div></dl>
+          </section>
+        </aside>
+      </section>
+    </main>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RoboPilot project tool contract",
+  "version": "0.1.0",
+  "invariants": {
+    "units": "SI",
+    "timestamps": "simulation seconds from run start",
+    "visual_evidence": "Agent tools return session-local paths; browser events may carry base64 separately.",
+    "oracle_data": "Simulator ground truth is labelled oracle/evaluation and never presented as a physical sensor."
+  },
+  "tools": [
+    {
+      "name": "run_project",
+      "description": "Run the active project in batch or live simulator mode.",
+      "input": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "duration_s": {"type": "number", "minimum": 0.1, "maximum": 120},
+          "mode": {"type": "string", "enum": ["batch", "live"]},
+          "scenario": {"type": "string", "maxLength": 80}
+        },
+        "required": ["duration_s", "mode", "scenario"]
+      }
+    },
+    {
+      "name": "get_run_summary",
+      "description": "Return compact numerical outcome and evidence references for one run.",
+      "input": {"type": "object", "additionalProperties": false, "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}
+    },
+    {
+      "name": "inspect_telemetry",
+      "description": "Return a bounded numerical signal window from a run.",
+      "input": {"type": "object", "additionalProperties": false, "properties": {"run_id": {"type": "string"}, "signals": {"type": "array", "items": {"type": "string"}, "maxItems": 8}, "start_s": {"type": "number"}, "end_s": {"type": "number"}}, "required": ["run_id", "signals"]}
+    },
+    {
+      "name": "get_visual_frame",
+      "description": "Return a local path to one robot/simulator camera frame.",
+      "input": {"type": "object", "additionalProperties": false, "properties": {"run_id": {"type": "string"}, "camera": {"type": "string"}, "t": {"type": "number"}}, "required": ["run_id", "camera"]}
+    },
+    {
+      "name": "compare_runs",
+      "description": "Compare task metrics between two recorded runs.",
+      "input": {"type": "object", "additionalProperties": false, "properties": {"base_run_id": {"type": "string"}, "candidate_run_id": {"type": "string"}}, "required": ["base_run_id", "candidate_run_id"]}
+    }
+  ],
+  "event_envelope": {
+    "type": "object",
+    "required": ["type", "project_id", "seq"],
+    "properties": {
+      "type": {"type": "string"},
+      "project_id": {"type": "string"},
+      "run_id": {"type": "string"},
+      "seq": {"type": "integer", "minimum": 1}
+    }
+  }
+}
+
