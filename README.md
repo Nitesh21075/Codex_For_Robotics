@@ -61,6 +61,14 @@ and records traction, braking, speed, route progress, frames, and telemetry.
 It is intentionally not presented as high-fidelity wheel/rail or flexible
 coupler physics; those require a future dedicated dynamics adapter.
 
+For a new robot name that fits an existing approved family (for example, an
+airport monorail using the rail-train family or a custom gripper using the
+articulated family), Codex can now create a project-local `adapter.json` and
+validate it with a short real run. A draft remains non-runnable in the UI;
+only a successful launch promotes it to `validated`. This is intentionally not
+unrestricted server-plugin authoring: project agents cannot alter RoboPilot's
+global simulator code or register arbitrary executable adapters.
+
 ## Architecture
 
 - `server/` owns sessions, workspace revisions, WebSocket events, simulator
@@ -69,6 +77,8 @@ coupler physics; those require a future dedicated dynamics adapter.
   thread per saved conversation. It runs with workspace-write access, network disabled,
   and the RoboPilot MCP tool server configured for that workspace.
 - `contracts/project_tools.json` freezes the agent-tool and event boundary.
+  The session MCP server includes adapter-capability discovery, draft creation,
+  and validation tools alongside run and evidence tools.
 - `web/` is a light-theme browser cockpit with chat/activity, project and model
   controls, a collapsible workspace directory tree, editable code, batch
   replay, live simulator display, camera evidence, and telemetry.

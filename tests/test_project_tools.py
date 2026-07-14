@@ -97,6 +97,8 @@ def test_agent_can_declare_and_validate_a_project_local_rail_adapter(tmp_path: P
     assert validation["validated"] is True
     assert validation["run"]["adapter"] == "rail_train_kinematic"
     assert json.loads((workspace / "adapter.json").read_text(encoding="utf-8"))["status"] == "validated"
+    normal_run = tools.run_project(0.2, "batch", "monorail_smoke")
+    assert normal_run["adapter"] == "rail_train_kinematic"
 
 
 def test_adapter_draft_must_match_the_spec_morphology(tmp_path: Path) -> None:
